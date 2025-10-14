@@ -12,7 +12,7 @@
     kubespray_dir: "{{ workspace }}/kubespray"
     inventory_dir: "{{ kubespray_dir }}/inventory/{{ cluster_name }}"
     kubeconfig_path: "{{ lookup('env','HOME') + '/.kube/config' }}"
-    # Sensible defaults for network (Kubespray defaults)
+    # Kubespray defaults
     pod_network_cidr: "10.233.64.0/18"
     service_cidr: "10.233.0.0/18"
     k8s_version: "v1.29.6"
@@ -53,23 +53,7 @@
       changed_when: galaxy_out.rc == 0
 
   tasks:
-    # -------------------- Create droplets --------------------
-    - name: Build list of control plane droplet names
-      ansible.builtin.set_fact:
-        cp_names: >-
-          {{ query('sequence', 'start=1 end=' + cp_count|string, wantlist=True)
-             | map('int')
-             | map('regex_replace','^(.*)$', basename ~ '-cp-' ~ '\\1')
-             | list }}
-
-    - name: Build list of worker droplet names
-      ansible.builtin.set_fact:
-        worker_names: >-
-          {{ query('sequence', 'start=1 end=' + worker_count|string, wantlist=True)
-             | map('int')
-             | map('regex_replace','^(.*)$', basename ~ '-wk-' ~ '\\1')
-             | list }}
-
+    # -------------------- Create droplets (range-based, no backrefs) --------------------
     - name: Create control-plane droplets
       community.digitalocean.digital_ocean_droplet:
         state: present
@@ -81,14 +65,10 @@
         monitoring: true
         ipv6: false
         backups: false
-        ssh_keys:
-          - "{{ ssh_key_id }}"
-        tags:
-          - "{{ cluster_name }}"
-          - "role:cp"
+        ssh_keys: ["{{ ssh_key_id }}"]
+        tags: ["{{ cluster_name }}", "role:cp"]
       loop: "{{ range(1, (cp_count | int) + 1) | list }}"
 
-    # --- Workers ---
     - name: Create worker droplets (if any)
       community.digitalocean.digital_ocean_droplet:
         state: present
@@ -100,37 +80,40 @@
         monitoring: true
         ipv6: false
         backups: false
-        ssh_keys:
-          - "{{ ssh_key_id }}"
-        tags:
-          - "{{ cluster_name }}"
-          - "role:worker"
+        ssh_keys: ["{{ ssh_key_id }}"]
+        tags: ["{{ cluster_name }}", "role:worker"]
       loop: "{{ range(1, (worker_count | int) + 1) | list }}"
       when: worker_count | int > 0
+
     - name: Wait a bit for droplets to boot
       ansible.builtin.pause:
         seconds: "{{ post_create_wait_seconds | int }}"
 
-    # FIX: list all droplets, then filter locally by tags
-    - name: Gather droplets info (all)
+    # -------------------- Discover droplets (robust shape handling) --------------------
+    - name: Gather droplets info (normalize output shape)
       community.digitalocean.digital_ocean_droplet_info:
         oauth_token: "{{ do_token }}"
       register: do_droplets_all
 
+    - name: Normalize droplets list
+      ansible.builtin.set_fact:
+        all_droplets: >-
+          {{ (do_droplets_all.data.droplets
+              if (do_droplets_all.data is mapping and ('droplets' in do_droplets_all.data))
+              else do_droplets_all.data) | default([], true) }}
+
     - name: Filter droplets for this cluster by tag
       ansible.builtin.set_fact:
-        cluster_droplets: >-
-          {{ do_droplets_all.data.droplets
-             | selectattr('tags','contains', cluster_name) | list }}
+        cluster_droplets: "{{ all_droplets | selectattr('tags','contains', cluster_name) | list }}"
 
     - name: Extract masters and workers with names/ids/public IPs
       ansible.builtin.set_fact:
         masters: >-
-          {{ {'droplets': cluster_droplets}
-             | json_query("droplets[?contains(tags, 'role:cp')].{name:name, id:id, ip: networks.v4[?type=='public']|[0].ip_address}") }}
+          {{ {'list': cluster_droplets}
+             | json_query("list[?contains(tags, 'role:cp')].{name:name, id:id, ip: networks.v4[?type=='public']|[0].ip_address}") }}
         workers: >-
-          {{ {'droplets': cluster_droplets}
-             | json_query("droplets[?contains(tags, 'role:worker')].{name:name, id:id, ip: networks.v4[?type=='public']|[0].ip_address}") }}
+          {{ {'list': cluster_droplets}
+             | json_query("list[?contains(tags, 'role:worker')].{name:name, id:id, ip: networks.v4[?type=='public']|[0].ip_address}") }}
 
     - name: Print server IP addresses
       ansible.builtin.debug:
@@ -140,6 +123,7 @@
           - "Workers names: {{ workers | map(attribute='name') | list }}"
           - "Workers IPs:   {{ workers | map(attribute='ip') | list }}"
 
+    # -------------------- API Load Balancer --------------------
     - name: Create DO Load Balancer for kube-apiserver
       community.digitalocean.digital_ocean_load_balancer:
         state: present
@@ -165,7 +149,7 @@
       ansible.builtin.set_fact:
         apiserver_lb_ip: "{{ apilb.data.ip }}"
 
-    # -------------------- Kubespray inventory --------------------
+    # -------------------- Kubespray inventory & config --------------------
     - name: Clone Kubespray
       ansible.builtin.git:
         repo: "{{ kubespray_repo }}"
