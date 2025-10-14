@@ -363,6 +363,22 @@
         regexp: '^(\s*server:\s*)https://.*:6443$'
         replace: '\1https://{{ apiserver_lb_addr }}:6443'
 
+    - name: Install kubectl client on localhost (match cluster version)
+      become: true
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/{{ k8s_version }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+
+    # optional: ensure it's on PATH for non-login shells
+    - name: Symlink kubectl into /usr/bin if needed
+      become: true
+      ansible.builtin.file:
+        src: /usr/local/bin/kubectl
+        dest: /usr/bin/kubectl
+        state: link
+      when: ansible_facts['os_family'] == 'Debian'
+
     - name: Sanity check kubectl can reach the cluster
       ansible.builtin.command: >
         kubectl --kubeconfig {{ kubeconfig_path }} get nodes -o wide
