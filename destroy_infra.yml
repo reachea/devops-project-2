@@ -8,7 +8,7 @@
     - ./group_vars/all.yml
 
   vars:
-    # If you want to delete local kubeconfig too, run with: -e delete_local_kubeconfig=true
+    # If you also want to delete local kubeconfig: -e delete_local_kubeconfig=true
     delete_local_kubeconfig: false
     kubeconfig_path: "{{ lookup('env','HOME') + '/.kube/config' }}"
 
@@ -36,16 +36,15 @@
 
   tasks:
     # -------------------- Discover resources --------------------
-    - name: Gather droplets info (all)
+    - name: Gather droplets info (returns `data` as a list on some versions)
       community.digitalocean.digital_ocean_droplet_info:
         oauth_token: "{{ do_token }}"
       register: do_droplets_all
 
-    - name: Filter droplets for this cluster by tag
+    - name: Filter droplets for this cluster by tag (data is a list)
       ansible.builtin.set_fact:
         cluster_droplets: >-
-          {{ do_droplets_all.data.droplets
-             | selectattr('tags','contains', cluster_name) | list }}
+          {{ do_droplets_all.data | selectattr('tags','contains', cluster_name) | list }}
 
     - name: Extract IDs and names
       ansible.builtin.set_fact:
@@ -67,7 +66,7 @@
         name: "{{ api_lb_name }}"
         region: "{{ region }}"
       register: lb_delete
-      failed_when: false # in case it doesn't exist
+      failed_when: false # tolerate 'not found'
 
     # -------------------- Delete droplets --------------------
     - name: Delete droplets (state=absent) by ID
@@ -84,8 +83,9 @@
         oauth_token: "{{ do_token }}"
       register: verify_droplets
       until: >-
-        {{ (verify_droplets.data.droplets
-            | selectattr('tags','contains', cluster_name) | list | length) == 0 }}
+        {{ (verify_droplets.data
+            | selectattr('tags','contains', cluster_name)
+            | list | length) == 0 }}
       retries: 15
       delay: 10
 
