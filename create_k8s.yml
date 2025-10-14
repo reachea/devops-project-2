@@ -246,6 +246,18 @@
         state: directory
         mode: "0755"
 
+    - name: Ensure group_vars directory exists
+      ansible.builtin.file:
+        path: "{{ inventory_dir }}/group_vars"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure group_vars/k8s_cluster directory exists
+      ansible.builtin.file:
+        path: "{{ inventory_dir }}/group_vars/k8s_cluster"
+        state: directory
+        mode: "0755"
+
     - name: Write hosts.yaml
       ansible.builtin.copy:
         dest: "{{ inventory_dir }}/hosts.yaml"
