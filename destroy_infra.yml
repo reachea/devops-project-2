@@ -1,0 +1,105 @@
+---
+- name: Destroy DigitalOcean infra for this cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ./group_vars/all.yml
+
+  vars:
+    # If you want to delete local kubeconfig too, run with: -e delete_local_kubeconfig=true
+    delete_local_kubeconfig: false
+    kubeconfig_path: "{{ lookup('env','HOME') + '/.kube/config' }}"
+
+  pre_tasks:
+    - name: Validate DigitalOcean token present
+      ansible.builtin.assert:
+        that:
+          - do_token | length > 0
+        fail_msg: "DO_TOKEN environment variable is required."
+
+    - name: Install base system deps
+      ansible.builtin.apt:
+        name:
+          - python3-pip
+          - jq
+        update_cache: true
+      become: true
+
+    - name: Install Ansible collections (DigitalOcean)
+      ansible.builtin.command: >
+        {{ lookup('env','HOME') + '/.local/bin/ansible-galaxy' }}
+        collection install community.digitalocean
+      register: galaxy_out
+      changed_when: galaxy_out.rc == 0
+
+  tasks:
+    # -------------------- Discover resources --------------------
+    - name: Gather droplets info (all)
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+      register: do_droplets_all
+
+    - name: Filter droplets for this cluster by tag
+      ansible.builtin.set_fact:
+        cluster_droplets: >-
+          {{ do_droplets_all.data.droplets
+             | selectattr('tags','contains', cluster_name) | list }}
+
+    - name: Extract IDs and names
+      ansible.builtin.set_fact:
+        droplet_ids: "{{ cluster_droplets | map(attribute='id') | list }}"
+        droplet_names: "{{ cluster_droplets | map(attribute='name') | list }}"
+
+    - name: Show what will be deleted
+      ansible.builtin.debug:
+        msg:
+          - "Cluster name/tag: {{ cluster_name }}"
+          - "Droplets to delete ({{ droplet_ids | length }}): {{ droplet_names }}"
+          - "API Load Balancer (by name): {{ api_lb_name }}"
+
+    # -------------------- Delete API Load Balancer --------------------
+    - name: Delete DO Load Balancer (API server)
+      community.digitalocean.digital_ocean_load_balancer:
+        state: absent
+        oauth_token: "{{ do_token }}"
+        name: "{{ api_lb_name }}"
+        region: "{{ region }}"
+      register: lb_delete
+      failed_when: false # in case it doesn't exist
+
+    # -------------------- Delete droplets --------------------
+    - name: Delete droplets (state=absent) by ID
+      community.digitalocean.digital_ocean_droplet:
+        state: absent
+        oauth_token: "{{ do_token }}"
+        id: "{{ item }}"
+      loop: "{{ droplet_ids }}"
+      when: droplet_ids | length > 0
+
+    # Optional: wait until all cluster-tagged droplets are gone
+    - name: Verify droplets are gone
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+      register: verify_droplets
+      until: >-
+        {{ (verify_droplets.data.droplets
+            | selectattr('tags','contains', cluster_name) | list | length) == 0 }}
+      retries: 15
+      delay: 10
+
+    # -------------------- Optional local cleanup --------------------
+    - name: Remove local kubeconfig (optional)
+      ansible.builtin.file:
+        path: "{{ kubeconfig_path }}"
+        state: absent
+      when: delete_local_kubeconfig | bool
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "✅ Destruction complete."
+          - "LB deleted (if existed): {{ api_lb_name }}"
+          - "Droplets deleted: {{ droplet_names }}"
+          - "Local kubeconfig removed: {{ delete_local_kubeconfig | bool }}"
