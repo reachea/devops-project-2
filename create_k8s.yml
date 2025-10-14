@@ -1,0 +1,459 @@
+---
+- name: Provision DO + Install HA K8s with Kubespray + Addons (no DNS automation)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - ./group_vars/all.yml
+
+  vars:
+    workspace: "{{ playbook_dir }}"
+    kubespray_dir: "{{ workspace }}/kubespray"
+    inventory_dir: "{{ kubespray_dir }}/inventory/{{ cluster_name }}"
+    kubeconfig_path: "{{ lookup('env','HOME') + '/.kube/config' }}"
+    pod_network_cidr: "10.233.64.0/18"
+    service_cidr: "10.233.0.0/18"
+    k8s_version: "v1.29.6"
+
+  pre_tasks:
+    - name: Validate DigitalOcean token present
+      ansible.builtin.assert:
+        that:
+          - do_token | length > 0
+        fail_msg: "DO_TOKEN environment variable is required."
+
+    - name: Install base system deps
+      ansible.builtin.apt:
+        name:
+          - git
+          - python3-pip
+          - python3-venv
+          - sshpass
+          - rsync
+          - jq
+        update_cache: true
+      become: true
+
+    - name: Install Python packages
+      ansible.builtin.pip:
+        name:
+          - "ansible==9.7.0"
+          - "kubernetes==29.0.0"
+          - "pyyaml"
+          - "jinja2"
+        extra_args: --user
+
+    - name: Install Ansible collections
+      ansible.builtin.command: >
+        {{ lookup('env','HOME') + '/.local/bin/ansible-galaxy' }}
+        collection install community.digitalocean kubernetes.core community.general
+      changed_when: "'Skipping' not in ansible_stdout | default('')"
+
+  tasks:
+    # -------------------- Create droplets --------------------
+    - name: Build list of control plane droplet names
+      ansible.builtin.set_fact:
+        cp_names: "{{ query('sequence', 'start=1 end=' + cp_count|string, wantlist=True) | map('int') | map('regex_replace','^(.*)$', basename + '-cp-' ~ '\\1') | list }}"
+
+    - name: Build list of worker droplet names
+      ansible.builtin.set_fact:
+        worker_names: "{{ query('sequence', 'start=1 end=' + worker_count|string, wantlist=True) | map('int') | map('regex_replace','^(.*)$', basename + '-wk-' ~ '\\1') | list }}"
+
+    - name: Create control-plane droplets
+      community.digitalocean.digital_ocean_droplet:
+        state: present
+        oauth_token: "{{ do_token }}"
+        name: "{{ item }}"
+        region: "{{ region }}"
+        image: "{{ image }}"
+        size: "{{ size_cp }}"
+        monitoring: true
+        ipv6: false
+        backups: false
+        ssh_keys:
+          - "{{ ssh_key_id }}"
+        tags:
+          - "{{ cluster_name }}"
+          - "role:cp"
+      loop: "{{ cp_names }}"
+
+    - name: Create worker droplets (if any)
+      community.digitalocean.digital_ocean_droplet:
+        state: present
+        oauth_token: "{{ do_token }}"
+        name: "{{ item }}"
+        region: "{{ region }}"
+        image: "{{ image }}"
+        size: "{{ size_worker }}"
+        monitoring: true
+        ipv6: false
+        backups: false
+        ssh_keys:
+          - "{{ ssh_key_id }}"
+        tags:
+          - "{{ cluster_name }}"
+          - "role:worker"
+      loop: "{{ worker_names }}"
+      when: worker_count|int > 0
+
+    - name: Wait a bit for droplets to boot
+      ansible.builtin.pause:
+        seconds: "{{ post_create_wait_seconds | int }}"
+
+    - name: Gather droplets info
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+        region: "{{ region }}"
+        filters:
+          tag_name: "{{ cluster_name }}"
+      register: do_droplets
+
+    - name: Extract master and worker IPs
+      ansible.builtin.set_fact:
+        masters: "{{ do_droplets.data | json_query(\"droplets[?contains(tags, 'role:cp')].{name:name, ip:networks.v4[?type=='public']|[0].ip_address, id:id}\") }}"
+        workers: "{{ do_droplets.data | json_query(\"droplets[?contains(tags, 'role:worker')].{name:name, ip:networks.v4[?type=='public']|[0].ip_address, id:id}\") }}"
+
+    - name: Print server IP addresses
+      ansible.builtin.debug:
+        msg:
+          - "Masters: {{ masters | map(attribute='name') | zip(masters | map(attribute='ip')) | list }}"
+          - "Workers: {{ workers | map(attribute='name') | zip(workers | map(attribute='ip')) | list }}"
+
+    - name: Create DO Load Balancer for kube-apiserver
+      community.digitalocean.digital_ocean_load_balancer:
+        state: present
+        oauth_token: "{{ do_token }}"
+        name: "{{ api_lb_name }}"
+        region: "{{ region }}"
+        droplet_ids: "{{ masters | map(attribute='id') | list }}"
+        forwarding_rules:
+          - entry_protocol: tcp
+            entry_port: 6443
+            target_protocol: tcp
+            target_port: 6443
+        health_check:
+          protocol: tcp
+          port: 6443
+          check_interval_seconds: 10
+          response_timeout_seconds: 5
+          unhealthy_threshold: 3
+          healthy_threshold: 5
+      register: apilb
+
+    - name: Set apiserver LB IP
+      ansible.builtin.set_fact:
+        apiserver_lb_ip: "{{ apilb.data.ip }}"
+
+    # -------------------- Kubespray inventory --------------------
+    - name: Clone Kubespray
+      ansible.builtin.git:
+        repo: "{{ kubespray_repo }}"
+        dest: "{{ kubespray_dir }}"
+        version: "{{ kubespray_branch }}"
+        depth: 1
+
+    - name: Create inventory directory
+      ansible.builtin.file:
+        path: "{{ inventory_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write hosts.yaml
+      ansible.builtin.copy:
+        dest: "{{ inventory_dir }}/hosts.yaml"
+        mode: "0644"
+        content: |
+          all:
+            hosts:
+          {% for m in masters %}
+              {{ m.name }}:
+                ansible_host: {{ m.ip }}
+                ip: {{ m.ip }}
+                access_ip: {{ m.ip }}
+                ansible_user: root
+          {% endfor %}
+          {% for w in workers %}
+              {{ w.name }}:
+                ansible_host: {{ w.ip }}
+                ip: {{ w.ip }}
+                access_ip: {{ w.ip }}
+                ansible_user: root
+          {% endfor %}
+            children:
+              kube_control_plane:
+                hosts:
+          {% for m in masters %}
+                  {{ m.name }}: {}
+          {% endfor %}
+              kube_node:
+                hosts:
+          {% for m in masters %}
+                  {{ m.name }}: {}
+          {% endfor %}
+          {% for w in workers %}
+                  {{ w.name }}: {}
+          {% endfor %}
+              etcd:
+                hosts:
+          {% for m in masters %}
+                  {{ m.name }}: {}
+          {% endfor %}
+              k8s_cluster:
+                children:
+                  kube_control_plane: {}
+                  kube_node: {}
+              calico_rr: {}
+
+    - name: Configure k8s-cluster.yml (DigitalOcean external CCM + LB IP)
+      ansible.builtin.copy:
+        dest: "{{ inventory_dir }}/group_vars/k8s_cluster/k8s-cluster.yml"
+        mode: "0644"
+        content: |
+          kube_version: "{{ k8s_version }}"
+          kube_network_plugin: calico
+          kube_pods_subnet: "{{ pod_network_cidr }}"
+          kube_service_addresses: "{{ service_cidr }}"
+          cloud_provider: external
+          external_cloud_provider: digitalocean
+          kubelet_loadbalancer_mode: "ipvs"
+          apiserver_loadbalancer_ip: "{{ apiserver_lb_ip }}"
+          apiserver_loadbalancer_port: 6443
+
+    - name: Enable dashboard & helm
+      ansible.builtin.copy:
+        dest: "{{ inventory_dir }}/group_vars/k8s_cluster/addons.yml"
+        mode: "0644"
+        content: |
+          dashboard_enabled: true
+          helm_enabled: true
+
+    - name: Disable SSH host key checking locally
+      ansible.builtin.lineinfile:
+        path: "{{ lookup('env','HOME') + '/.ssh/config' }}"
+        line: "Host *\n    StrictHostKeyChecking no\n    UserKnownHostsFile=/dev/null"
+        create: true
+        mode: "0600"
+
+    - name: Run Kubespray
+      ansible.builtin.command: >
+        {{ lookup('env','HOME') + '/.local/bin/ansible-playbook' }}
+        -i {{ inventory_dir }}/hosts.yaml
+        -b -u root cluster.yml
+      args:
+        chdir: "{{ kubespray_dir }}"
+
+    - name: Fetch kubeconfig from first master
+      ansible.builtin.command: >
+        scp -o StrictHostKeyChecking=no
+        root@{{ (masters | first).ip }}:/etc/kubernetes/admin.conf
+        {{ kubeconfig_path }}
+      changed_when: true
+
+    - name: Ensure kube dir perms
+      ansible.builtin.file:
+        path: "{{ kubeconfig_path | dirname }}"
+        state: directory
+        mode: "0700"
+
+    # -------------------- Addons --------------------
+    - name: Install ingress-nginx (cloud provider)
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+        dest: ./artifacts/ingress-nginx.yaml
+
+    - name: Apply ingress-nginx
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: ./artifacts/ingress-nginx.yaml
+
+    - name: Install cert-manager
+      ansible.builtin.get_url:
+        url: https://github.com/cert-manager/cert-manager/releases/download/v1.15.3/cert-manager.yaml
+        dest: ./artifacts/cert-manager.yaml
+
+    - name: Apply cert-manager
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: ./artifacts/cert-manager.yaml
+
+    - name: Create ClusterIssuer (Let's Encrypt)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-production
+          spec:
+            acme:
+              email: "{{ email_acme }}"
+              server: https://acme-v02.api.letsencrypt.org/directory
+              privateKeySecretRef:
+                name: le-account-key
+              solvers:
+                - http01:
+                    ingress:
+                      class: nginx
+
+    - name: Install ArgoCD
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+        dest: ./artifacts/argocd.yaml
+
+    - name: Apply ArgoCD
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: ./artifacts/argocd.yaml
+
+    - name: Expose ArgoCD with Ingress + TLS
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: argocd-server
+            namespace: argocd
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              cert-manager.io/cluster-issuer: letsencrypt-production
+          spec:
+            tls:
+              - hosts: ["{{ argocd_domain }}"]
+                secretName: argocd-tls
+            rules:
+              - host: "{{ argocd_domain }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: argocd-server
+                          port:
+                            number: 80
+
+    - name: Install Kubernetes Dashboard
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+        dest: ./artifacts/dashboard.yaml
+
+    - name: Apply Dashboard
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: ./artifacts/dashboard.yaml
+
+    - name: Create admin SA & RBAC
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: admin-user
+            namespace: kubernetes-dashboard
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: admin-user
+          subjects:
+            - kind: ServiceAccount
+              name: admin-user
+              namespace: kubernetes-dashboard
+          roleRef:
+            kind: ClusterRole
+            name: cluster-admin
+            apiGroup: rbac.authorization.k8s.io
+
+    - name: Expose Dashboard with Ingress + TLS
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              cert-manager.io/cluster-issuer: letsencrypt-production
+          spec:
+            tls:
+              - hosts: ["{{ dashboard_domain }}"]
+                secretName: dashboard-tls
+            rules:
+              - host: "{{ dashboard_domain }}"
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: kubernetes-dashboard
+                          port:
+                            number: 80
+
+    # -------------------- Wait for Ingress LB & Prompt for DNS --------------------
+    - name: Wait for ingress-nginx external IP
+      vars:
+        svc_ns: ingress-nginx
+        svc_name: ingress-nginx-controller
+      until: ingress_ip is defined and ingress_ip | length > 0
+      retries: 60
+      delay: 10
+      block:
+        - name: Get service JSON
+          ansible.builtin.command: kubectl -n {{ svc_ns }} get svc {{ svc_name }} -o json
+          environment:
+            KUBECONFIG: "{{ kubeconfig_path }}"
+          register: svcjson
+          changed_when: false
+        - name: Parse external IP
+          ansible.builtin.set_fact:
+            ingress_ip: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].ip | default('') }}"
+
+    - name: Show DNS instructions
+      ansible.builtin.debug:
+        msg:
+          - "Ingress external IP: {{ ingress_ip }}"
+          - "Please create A records pointing to this IP:"
+          - "  - {{ argocd_domain }} -> {{ ingress_ip }}"
+          - "  - {{ dashboard_domain }} -> {{ ingress_ip }}"
+
+    - name: Confirm DNS added or wait
+      ansible.builtin.pause:
+        prompt: "Add the DNS A records now, then press Enter to continue (or wait {{ dns_wait_seconds }}s if you set dns_wait_mode: seconds)."
+        seconds: "{{ 0 if dns_wait_mode == 'prompt' else dns_wait_seconds | int }}"
+
+    - name: Show ArgoCD admin password
+      ansible.builtin.command: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: argopass_b64
+      changed_when: false
+
+    - name: Print access info
+      ansible.builtin.debug:
+        msg:
+          - "API LB (6443): {{ apiserver_lb_ip }}"
+          - "Ingress IP: {{ ingress_ip }}"
+          - "ArgoCD: https://{{ argocd_domain }}  (admin / {{ (argopass_b64.stdout | b64decode) if argopass_b64.stdout else 'N/A' }})"
+          - "Dashboard: https://{{ dashboard_domain }} (token printed below)"
+    - name: Print Dashboard token
+      ansible.builtin.command: kubectl -n kubernetes-dashboard create token admin-user
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: dash_token
+      changed_when: false
+    - ansible.builtin.debug:
+        msg: "Dashboard token: {{ dash_token.stdout }}"

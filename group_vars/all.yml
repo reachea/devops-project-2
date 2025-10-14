@@ -1,0 +1,34 @@
+# --- DigitalOcean ---
+do_token: "{{ lookup('env','DO_TOKEN') | default('', true) }}"
+region: "sgp1"
+image: "ubuntu-22-04-x64"
+size_cp: "s-2vcpu-4gb"
+size_worker: "s-2vcpu-4gb"
+
+# Read your DO SSH key id from env as well (numeric)
+ssh_key_id: 51253476
+
+# Cluster sizing — default 1 master + 2 workers for your case
+cp_count: 1
+worker_count: 2
+
+# Names
+cluster_name: "prod-k8s"
+basename: "k8s-node"
+api_lb_name: "k8s-apiserver-lb"
+ingress_lb_name: "k8s-ingress-lb"
+
+# Domains
+base_domain: "reacheasambath.com"
+dashboard_domain: "dashboard.reacheasambath.com"
+argocd_domain: "argocd.reacheasambath.com"
+email_acme: "reacheasambath@gmail.com"
+
+# Wait knobs
+post_create_wait_seconds: 60
+dns_wait_mode: prompt # or "seconds"
+dns_wait_seconds: 120
+
+# Kubespray
+kubespray_repo: https://github.com/kubernetes-sigs/kubespray.git
+kubespray_branch: release-2.24  # or another valid tag/branch that exists
