@@ -52,7 +52,7 @@
       changed_when: galaxy_out.rc == 0
 
   tasks:
-    # -------------------- Create droplets (range-based, no backrefs) --------------------
+    # -------------------- Create droplets (no backrefs) --------------------
     - name: Create control-plane droplets
       community.digitalocean.digital_ocean_droplet:
         state: present
@@ -122,7 +122,7 @@
           - "Workers names: {{ workers | map(attribute='name') | list }}"
           - "Workers IPs:   {{ workers | map(attribute='ip') | list }}"
 
-    # -------------------- API Load Balancer (robust address fetch) --------------------
+    # -------------------- API Load Balancer (wait with `until` on a single task) --------------------
     - name: Create DO Load Balancer for kube-apiserver
       community.digitalocean.digital_ocean_load_balancer:
         state: present
@@ -142,33 +142,61 @@
           response_timeout_seconds: 5
           unhealthy_threshold: 3
           healthy_threshold: 5
-      register: apilb
 
-    - name: Wait for API LB to have an address (IP or hostname)
+    - name: Get LB info until API LB has an address
+      community.digitalocean.digital_ocean_load_balancer_info:
+        oauth_token: "{{ do_token }}"
+      register: do_lbs
+      until: >
+        (
+          (
+            (do_lbs.data.load_balancers
+              if (do_lbs.data is mapping and ('load_balancers' in do_lbs.data))
+              else do_lbs.data) | default([], true)
+            | selectattr('name','equalto', api_lb_name) | list | length
+          ) > 0
+        )
+        and
+        (
+          (
+            (
+              ( (do_lbs.data.load_balancers
+                    if (do_lbs.data is mapping and ('load_balancers' in do_lbs.data))
+                    else do_lbs.data) | default([], true)
+              | selectattr('name','equalto', api_lb_name) | list | first ) | default({})
+            ).ip | default('') | length > 0
+          )
+          or
+          (
+            (
+              ( (do_lbs.data.load_balancers
+                    if (do_lbs.data is mapping and ('load_balancers' in do_lbs.data))
+                    else do_lbs.data) | default([], true)
+              | selectattr('name','equalto', api_lb_name) | list | first ) | default({})
+            ).hostname | default('') | length > 0
+          )
+        )
       retries: 30
       delay: 10
-      until: apiserver_lb_addr | length > 0
-      block:
-        - name: List load balancers
-          community.digitalocean.digital_ocean_load_balancer_info:
-            oauth_token: "{{ do_token }}"
-          register: do_lbs
+      changed_when: false
 
-        - name: Normalize LB list
-          ansible.builtin.set_fact:
-            lb_list: >-
-              {{ (do_lbs.data.load_balancers
+    - name: Extract API LB address
+      ansible.builtin.set_fact:
+        apiserver_lb_addr: >-
+          {{
+            (
+              (
+                (do_lbs.data.load_balancers
                   if (do_lbs.data is mapping and ('load_balancers' in do_lbs.data))
-                  else do_lbs.data) | default([], true) }}
-
-        - name: Extract API LB record by name
-          ansible.builtin.set_fact:
-            api_lb_rec: "{{ (lb_list | selectattr('name','equalto', api_lb_name) | list | first) | default({}) }}"
-
-        - name: Set apiserver LB address var
-          ansible.builtin.set_fact:
-            apiserver_lb_addr: >-
-              {{ (api_lb_rec.ip | default('')) if (api_lb_rec.ip | default('') | length > 0) else (api_lb_rec.hostname | default('')) }}
+                  else do_lbs.data) | default([], true)
+              | selectattr('name','equalto', api_lb_name) | list | first
+            ) | default({})
+          | community.general.dict_kv('ip','hostname') | select('string') | list | first
+          }}
+      vars:
+        # helper filter: pick 'ip' if present else 'hostname'
+        # (dict_kv returns values; select('string') removes empty)
+        _ignore: ""
 
     # -------------------- Kubespray inventory & config --------------------
     - name: Clone Kubespray
