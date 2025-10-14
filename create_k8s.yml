@@ -357,6 +357,25 @@
         {{ kubeconfig_path }}
       changed_when: true
 
+    - name: Rewrite kubeconfig server to the DO LB address
+      ansible.builtin.replace:
+        path: "{{ kubeconfig_path }}"
+        regexp: '^(\s*server:\s*)https://.*:6443$'
+        replace: '\1https://{{ apiserver_lb_addr }}:6443'
+
+    - name: Sanity check kubectl can reach the cluster
+      ansible.builtin.command: >
+        kubectl --kubeconfig {{ kubeconfig_path }} get nodes -o wide
+      register: kubectl_nodes
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: kubectl_nodes.rc == 0
+
+    - name: Show cluster nodes (for visibility)
+      ansible.builtin.debug:
+        var: kubectl_nodes.stdout_lines
+
     - name: Ensure kube dir perms
       ansible.builtin.file:
         path: "{{ kubeconfig_path | dirname }}"
