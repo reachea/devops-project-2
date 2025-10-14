@@ -412,6 +412,48 @@
         state: present
         src: ./cert-manager.yaml
 
+    # --- Wait for cert-manager CRDs to register ---
+    - name: Wait for cert-manager CRDs to be discoverable
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get crd certificates.cert-manager.io
+      register: cm_crd_check
+      changed_when: false
+      retries: 30
+      delay: 5
+      until: cm_crd_check.rc == 0
+
+    # --- Wait for cert-manager deployments to become Available ---
+    - name: Wait for cert-manager controller rollout
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n cert-manager rollout status deploy/cert-manager --timeout=120s
+      register: cm_ctrl_rollout
+      changed_when: false
+      retries: 10
+      delay: 6
+      until: cm_ctrl_rollout.rc == 0
+
+    - name: Wait for cert-manager cainjector rollout
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=120s
+      register: cm_cainj_rollout
+      changed_when: false
+      retries: 10
+      delay: 6
+      until: cm_cainj_rollout.rc == 0
+
+    - name: Wait for cert-manager webhook rollout
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n cert-manager rollout status deploy/cert-manager-webhook --timeout=120s
+      register: cm_webhook_rollout
+      changed_when: false
+      retries: 10
+      delay: 6
+      until: cm_webhook_rollout.rc == 0
+
     - name: Create ClusterIssuer (Let's Encrypt)
       kubernetes.core.k8s:
         kubeconfig: "{{ kubeconfig_path }}"
