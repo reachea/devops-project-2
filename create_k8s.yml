@@ -370,18 +370,9 @@
         dest: /usr/local/bin/kubectl
         mode: "0755"
 
-    # optional: ensure it's on PATH for non-login shells
-    - name: Symlink kubectl into /usr/bin if needed
-      become: true
-      ansible.builtin.file:
-        src: /usr/local/bin/kubectl
-        dest: /usr/bin/kubectl
-        state: link
-      when: ansible_facts['os_family'] == 'Debian'
-
     - name: Sanity check kubectl can reach the cluster
       ansible.builtin.command: >
-        kubectl --kubeconfig {{ kubeconfig_path }} get nodes -o wide
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }} get nodes -o wide
       register: kubectl_nodes
       changed_when: false
       retries: 12
