@@ -12,7 +12,6 @@
     kubespray_dir: "{{ workspace }}/kubespray"
     inventory_dir: "{{ kubespray_dir }}/inventory/{{ cluster_name }}"
     kubeconfig_path: "{{ lookup('env','HOME') + '/.kube/config' }}"
-    # Kubespray defaults
     pod_network_cidr: "10.233.64.0/18"
     service_cidr: "10.233.0.0/18"
     k8s_version: "v1.29.6"
@@ -123,7 +122,7 @@
           - "Workers names: {{ workers | map(attribute='name') | list }}"
           - "Workers IPs:   {{ workers | map(attribute='ip') | list }}"
 
-    # -------------------- API Load Balancer --------------------
+    # -------------------- API Load Balancer (robust address fetch) --------------------
     - name: Create DO Load Balancer for kube-apiserver
       community.digitalocean.digital_ocean_load_balancer:
         state: present
@@ -145,9 +144,31 @@
           healthy_threshold: 5
       register: apilb
 
-    - name: Set apiserver LB IP
-      ansible.builtin.set_fact:
-        apiserver_lb_ip: "{{ apilb.data.ip }}"
+    - name: Wait for API LB to have an address (IP or hostname)
+      retries: 30
+      delay: 10
+      until: apiserver_lb_addr | length > 0
+      block:
+        - name: List load balancers
+          community.digitalocean.digital_ocean_load_balancer_info:
+            oauth_token: "{{ do_token }}"
+          register: do_lbs
+
+        - name: Normalize LB list
+          ansible.builtin.set_fact:
+            lb_list: >-
+              {{ (do_lbs.data.load_balancers
+                  if (do_lbs.data is mapping and ('load_balancers' in do_lbs.data))
+                  else do_lbs.data) | default([], true) }}
+
+        - name: Extract API LB record by name
+          ansible.builtin.set_fact:
+            api_lb_rec: "{{ (lb_list | selectattr('name','equalto', api_lb_name) | list | first) | default({}) }}"
+
+        - name: Set apiserver LB address var
+          ansible.builtin.set_fact:
+            apiserver_lb_addr: >-
+              {{ (api_lb_rec.ip | default('')) if (api_lb_rec.ip | default('') | length > 0) else (api_lb_rec.hostname | default('')) }}
 
     # -------------------- Kubespray inventory & config --------------------
     - name: Clone Kubespray
@@ -209,7 +230,7 @@
                   kube_node: {}
               calico_rr: {}
 
-    - name: Configure k8s-cluster.yml (DigitalOcean external CCM + LB IP)
+    - name: Configure k8s-cluster.yml (DigitalOcean external CCM + LB address)
       ansible.builtin.copy:
         dest: "{{ inventory_dir }}/group_vars/k8s_cluster/k8s-cluster.yml"
         mode: "0644"
@@ -221,8 +242,9 @@
           cloud_provider: external
           external_cloud_provider: digitalocean
           kubelet_loadbalancer_mode: "ipvs"
-          apiserver_loadbalancer_ip: "{{ apiserver_lb_ip }}"
-          apiserver_loadbalancer_port: 6443
+          loadbalancer_apiserver:
+            address: "{{ apiserver_lb_addr }}"
+            port: 6443
 
     - name: Enable dashboard & helm
       ansible.builtin.copy:
@@ -407,7 +429,7 @@
                             number: 80
 
     # -------------------- Wait for Ingress LB & Prompt for DNS --------------------
-    - name: Wait for ingress-nginx external IP to be assigned
+    - name: Wait for ingress-nginx external IP/hostname to be assigned
       ansible.builtin.command: kubectl -n ingress-nginx get svc ingress-nginx-controller -o json
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
@@ -425,7 +447,7 @@
       ansible.builtin.set_fact:
         ingress_ip: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].ip | default('') }}"
         ingress_hostname: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].hostname | default('') }}"
-        ingress_addr: "{{ ingress_ip | default(ingress_hostname, true) }}"
+        ingress_addr: "{{ (ingress_ip | length > 0) | ternary(ingress_ip, ingress_hostname) }}"
 
     - name: Show DNS instructions
       ansible.builtin.debug:
@@ -451,7 +473,7 @@
     - name: Print access info
       ansible.builtin.debug:
         msg:
-          - "API LB (6443): {{ apiserver_lb_ip }}"
+          - "API LB (6443): {{ apiserver_lb_addr }}"
           - "Ingress: {{ ingress_addr }}"
           - "ArgoCD: https://{{ argocd_domain }}  (admin / {{ (argopass_b64.stdout | b64decode) if argopass_b64.stdout else 'N/A' }})"
           - "Dashboard: https://{{ dashboard_domain }} (token printed below)"
