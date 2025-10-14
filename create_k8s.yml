@@ -49,25 +49,26 @@
       ansible.builtin.command: >
         {{ lookup('env','HOME') + '/.local/bin/ansible-galaxy' }}
         collection install community.digitalocean kubernetes.core community.general
-      changed_when: "'Skipping' not in ansible_stdout | default('')"
+      register: galaxy_out
+      changed_when: galaxy_out.rc == 0
 
   tasks:
     # -------------------- Create droplets --------------------
     - name: Build list of control plane droplet names
       ansible.builtin.set_fact:
-        cp_names:
-          "{{ query('sequence', 'start=1 end=' + cp_count|string, wantlist=True)
-          | map('int')
-          | map('regex_replace','^(.*)$', basename + '-cp-' ~ '\\1')
-          | list }}"
+        cp_names: >-
+          {{ query('sequence', 'start=1 end=' + cp_count|string, wantlist=True)
+             | map('int')
+             | map('regex_replace','^(.*)$', basename ~ '-cp-' ~ '\\1')
+             | list }}
 
     - name: Build list of worker droplet names
       ansible.builtin.set_fact:
-        worker_names:
-          "{{ query('sequence', 'start=1 end=' + worker_count|string, wantlist=True)
-          | map('int')
-          | map('regex_replace','^(.*)$', basename + '-wk-' ~ '\\1')
-          | list }}"
+        worker_names: >-
+          {{ query('sequence', 'start=1 end=' + worker_count|string, wantlist=True)
+             | map('int')
+             | map('regex_replace','^(.*)$', basename ~ '-wk-' ~ '\\1')
+             | list }}
 
     - name: Create control-plane droplets
       community.digitalocean.digital_ocean_droplet:
@@ -110,26 +111,34 @@
       ansible.builtin.pause:
         seconds: "{{ post_create_wait_seconds | int }}"
 
-    - name: Gather droplets info
+    # FIX: list all droplets, then filter locally by tags
+    - name: Gather droplets info (all)
       community.digitalocean.digital_ocean_droplet_info:
         oauth_token: "{{ do_token }}"
-        region: "{{ region }}"
-        filters:
-          tag_name: "{{ cluster_name }}"
-      register: do_droplets
+      register: do_droplets_all
 
-    - name: Extract master and worker IPs
+    - name: Filter droplets for this cluster by tag
       ansible.builtin.set_fact:
-        masters: '{{ do_droplets.data
-          | json_query("droplets[?contains(tags, ''role:cp'')].{name:name, ip:networks.v4[?type==''public'']|[0].ip_address, id:id}") }}'
-        workers: '{{ do_droplets.data
-          | json_query("droplets[?contains(tags, ''role:worker'')].{name:name, ip:networks.v4[?type==''public'']|[0].ip_address, id:id}") }}'
+        cluster_droplets: >-
+          {{ do_droplets_all.data.droplets
+             | selectattr('tags','contains', cluster_name) | list }}
+
+    - name: Extract masters and workers with names/ids/public IPs
+      ansible.builtin.set_fact:
+        masters: >-
+          {{ {'droplets': cluster_droplets}
+             | json_query("droplets[?contains(tags, 'role:cp')].{name:name, id:id, ip: networks.v4[?type=='public']|[0].ip_address}") }}
+        workers: >-
+          {{ {'droplets': cluster_droplets}
+             | json_query("droplets[?contains(tags, 'role:worker')].{name:name, id:id, ip: networks.v4[?type=='public']|[0].ip_address}") }}
 
     - name: Print server IP addresses
       ansible.builtin.debug:
         msg:
-          - "Masters: {{ masters | map('extract', attribute='name') | list }} -> {{ masters | map('extract', attribute='ip') | list }}"
-          - "Workers: {{ workers | map('extract', attribute='name') | list }} -> {{ workers | map('extract', attribute='ip') | list }}"
+          - "Masters names: {{ masters | map(attribute='name') | list }}"
+          - "Masters IPs:   {{ masters | map(attribute='ip') | list }}"
+          - "Workers names: {{ workers | map(attribute='name') | list }}"
+          - "Workers IPs:   {{ workers | map(attribute='ip') | list }}"
 
     - name: Create DO Load Balancer for kube-apiserver
       community.digitalocean.digital_ocean_load_balancer:
@@ -432,9 +441,7 @@
       ansible.builtin.set_fact:
         ingress_ip: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].ip | default('') }}"
         ingress_hostname: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].hostname | default('') }}"
-        ingress_addr:
-          "{{ ( (svcjson.stdout | from_json).status.loadBalancer.ingress[0].ip | default('') ) |
-          default((svcjson.stdout | from_json).status.loadBalancer.ingress[0].hostname, true) }}"
+        ingress_addr: "{{ ingress_ip | default(ingress_hostname, true) }}"
 
     - name: Show DNS instructions
       ansible.builtin.debug:
