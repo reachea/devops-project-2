@@ -343,6 +343,13 @@
       args:
         chdir: "{{ kubespray_dir }}"
 
+    # --- kubeconfig on the runner (localhost) ---
+    - name: Ensure ~/.kube exists on localhost
+      ansible.builtin.file:
+        path: "{{ kubeconfig_path | dirname }}"
+        state: directory
+        mode: "0700"
+
     - name: Fetch kubeconfig from first master
       ansible.builtin.command: >
         scp -o StrictHostKeyChecking=no
