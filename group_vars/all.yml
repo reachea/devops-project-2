@@ -31,4 +31,4 @@ dns_wait_seconds: 120
 
 # Kubespray
 kubespray_repo: https://github.com/kubernetes-sigs/kubespray.git
-kubespray_branch: release-2.24  # or another valid tag/branch that exists
+kubespray_branch: release-2.24 # or another valid tag/branch that exists
