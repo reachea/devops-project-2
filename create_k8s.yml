@@ -584,7 +584,7 @@
               failed_when: false
 
         - name: If rollout still failed after remediation, try one more time with extended timeout
-          when: cm_rollout_failed and (cm_ctrl_rollout_after_patch is not defined or cm_ctrl_rollout_after_patch.rc != 0)
+          when: cm_rollout_failed and (cm_ctrl_rollout_after_patch is not defined or cm_ctrl_rollout_after_patch.skipped | default(false) or cm_ctrl_rollout_after_patch.rc | default(1) != 0)
           block:
             - name: Final rollout attempt with extended timeout
               ansible.builtin.command: >
@@ -695,9 +695,9 @@
           failed_when: false
 
         - name: Show ALL cluster events (for scheduling issues)
-          ansible.builtin.command: >
+          ansible.builtin.shell: >
             /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
-            get events --all-namespaces --sort-by=.lastTimestamp
+            get events --all-namespaces --sort-by=.lastTimestamp | tail -n 50
           register: cluster_events
           changed_when: false
           failed_when: false
@@ -739,7 +739,7 @@
               - "{{ cm_events.stdout_lines | default([]) }}"
               - ""
               - "ALL CLUSTER EVENTS (last 50):"
-              - "{{ cluster_events.stdout_lines | default([]) | list[-50:] }}"
+              - "{{ cluster_events.stdout_lines | default([]) }}"
 
         - name: Fail cert-manager rollout only if no pods are running
           ansible.builtin.fail:
