@@ -427,7 +427,7 @@
       register: cm_apply
       changed_when: "'created' in cm_apply.stdout or 'configured' in cm_apply.stdout"
 
-    # --- Waits (CRDs & Deployments) ---
+    # --- Wait for cert-manager CRDs to register (unchanged) ---
     - name: Wait for cert-manager CRDs to register
       ansible.builtin.command: >
         /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
@@ -438,35 +438,149 @@
       delay: 5
       until: cm_crd_check.rc == 0
 
-    - name: Wait for cert-manager controller rollout
-      ansible.builtin.command: >
-        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
-        -n cert-manager rollout status deploy/cert-manager --timeout=180s
-      register: cm_ctrl_rollout
-      changed_when: false
-      retries: 10
-      delay: 8
-      until: cm_ctrl_rollout.rc == 0
+    # --- Robust rollout with auto-remediation + diagnostics ---
+    - name: Rollout cert-manager with remediation and diagnostics
+      block:
+        - name: Wait for cert-manager pods to appear
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager get pods
+          register: cm_pods_initial
+          changed_when: false
+          retries: 20
+          delay: 6
+          until: cm_pods_initial.rc == 0
 
-    - name: Wait for cert-manager cainjector rollout
-      ansible.builtin.command: >
-        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
-        -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
-      register: cm_cainj_rollout
-      changed_when: false
-      retries: 10
-      delay: 8
-      until: cm_cainj_rollout.rc == 0
+        - name: Try rollout of all cert-manager deployments
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager rollout status deploy/cert-manager
+            --timeout=180s
+          register: cm_ctrl_rollout
+          changed_when: false
 
-    - name: Wait for cert-manager webhook rollout
-      ansible.builtin.command: >
-        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
-        -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
-      register: cm_webhook_rollout
-      changed_when: false
-      retries: 10
-      delay: 8
-      until: cm_webhook_rollout.rc == 0
+        - name: Record rollout failed?
+          ansible.builtin.set_fact:
+            cm_rollout_failed: "{{ cm_ctrl_rollout.rc != 0 }}"
+
+        - name: Collect pod JSON (for analysis)
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager get pods -o json
+          register: cm_pods_json
+          changed_when: false
+
+        - name: Detect ImagePullBackOff on controller
+          ansible.builtin.set_fact:
+            cm_pull_issue: >-
+              {{ (cm_pods_json.stdout | from_json).items
+                | selectattr('metadata.labels.app','equalto','cert-manager')
+                | map(attribute='status.containerStatuses') | list | sum(start=[])
+                | selectattr('state.waiting.reason','defined')
+                | selectattr('state.waiting.reason','equalto','ImagePullBackOff')
+                | list | length > 0 }}
+
+        - name: If ImagePullBackOff, retarget images to ghcr.io and retry rollout
+          when: cm_rollout_failed and cm_pull_issue
+          block:
+            - name: Patch controller image to ghcr.io
+              ansible.builtin.command: >
+                /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+                -n cert-manager set image deploy/cert-manager
+                cert-manager-controller=ghcr.io/cert-manager/cert-manager-controller:{{ cert_manager_version }}
+              changed_when: true
+
+            - name: Patch cainjector image to ghcr.io
+              ansible.builtin.command: >
+                /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+                -n cert-manager set image deploy/cert-manager-cainjector
+                cert-manager-cainjector=ghcr.io/cert-manager/cert-manager-cainjector:{{ cert_manager_version }}
+              changed_when: true
+
+            - name: Patch webhook image to ghcr.io
+              ansible.builtin.command: >
+                /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+                -n cert-manager set image deploy/cert-manager-webhook
+                cert-manager-webhook=ghcr.io/cert-manager/cert-manager-webhook:{{ cert_manager_version }}
+              changed_when: true
+
+            - name: Retry rollout after image patch
+              ansible.builtin.command: >
+                /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+                -n cert-manager rollout status deploy/cert-manager --timeout=240s
+              register: cm_ctrl_rollout_after_patch
+              changed_when: false
+              retries: 10
+              delay: 8
+              until: cm_ctrl_rollout_after_patch.rc == 0
+
+        - name: Ensure cainjector rollout (post controller OK)
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=240s
+          register: cm_cainj_rollout
+          changed_when: false
+          retries: 10
+          delay: 8
+          until: cm_cainj_rollout.rc == 0
+
+        - name: Ensure webhook rollout (post controller OK)
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager rollout status deploy/cert-manager-webhook --timeout=240s
+          register: cm_webhook_rollout
+          changed_when: false
+          retries: 10
+          delay: 8
+          until: cm_webhook_rollout.rc == 0
+
+      rescue:
+        - name: Show cert-manager pods
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager get pods -o wide
+          register: cm_pods
+          changed_when: false
+          failed_when: false
+
+        - name: Describe cert-manager deployment
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager describe deploy/cert-manager
+          register: cm_deploy_desc
+          changed_when: false
+          failed_when: false
+
+        - name: Tail controller logs
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager logs deploy/cert-manager --tail=200
+          register: cm_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Show recent namespace events
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager get events --sort-by=.lastTimestamp | tail -n 80
+          register: cm_events
+          changed_when: false
+          failed_when: false
+
+        - name: Diagnostics (cert-manager)
+          ansible.builtin.debug:
+            msg:
+              - "pods:"
+              - "{{ cm_pods.stdout_lines | default([]) }}"
+              - "deploy describe:"
+              - "{{ cm_deploy_desc.stdout_lines | default([]) }}"
+              - "logs (controller):"
+              - "{{ cm_logs.stdout_lines | default([]) }}"
+              - "recent events:"
+              - "{{ cm_events.stdout_lines | default([]) }}"
+        - name: Fail cert-manager rollout
+          ansible.builtin.fail:
+            msg: "cert-manager failed to roll out; see diagnostics above."
 
     # --- Diagnostics if rollout still flaky ---
     - name: Show cert-manager pods (debug)
