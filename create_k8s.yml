@@ -390,6 +390,75 @@
         mode: "0700"
 
     # -------------------- Addons --------------------
+
+    # --- Pre-flight checks before installing addons ---
+    - name: Verify cluster nodes are Ready
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get nodes -o json
+      register: nodes_status
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: >
+        (nodes_status.stdout | from_json)['items']
+        | selectattr('status.conditions', 'defined')
+        | map(attribute='status.conditions')
+        | sum(start=[])
+        | selectattr('type', 'equalto', 'Ready')
+        | selectattr('status', 'equalto', 'True')
+        | list | length >= (cp_count + worker_count)
+
+    - name: Show node status
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get nodes -o wide
+      register: nodes_ready
+      changed_when: false
+
+    - name: Display nodes
+      ansible.builtin.debug:
+        msg: "{{ nodes_ready.stdout_lines }}"
+
+    - name: Check if worker nodes can schedule pods (no NoSchedule taints)
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get nodes -o json
+      register: node_taints_check
+      changed_when: false
+
+    - name: Check for NoSchedule taints on control plane
+      ansible.builtin.shell: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].spec.taints[?(@.effect=="NoSchedule")].key}'
+      register: cp_taints
+      changed_when: false
+      failed_when: false
+
+    - name: Display control plane taints
+      ansible.builtin.debug:
+        msg: "Control plane NoSchedule taints: {{ cp_taints.stdout | default('none') }}"
+
+    - name: Remove NoSchedule taint from control plane if present and workers exist
+      when:
+        - worker_count | int > 0
+        - "'node-role.kubernetes.io/control-plane' in cp_taints.stdout"
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        taint nodes -l node-role.kubernetes.io/control-plane node-role.kubernetes.io/control-plane:NoSchedule-
+      register: untaint_result
+      changed_when: untaint_result.rc == 0
+      failed_when: false
+
+    - name: Allow scheduling on control plane if no workers (single-node cluster)
+      when: worker_count | int == 0
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-
+      register: untaint_single
+      changed_when: untaint_single.rc == 0
+      failed_when: false
+
     - name: Download ingress-nginx manifest (cloud provider)
       ansible.builtin.get_url:
         url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
@@ -577,11 +646,27 @@
                 all_deployments_ok: "{{ running_pods_count | int >= 3 }}"
 
       rescue:
+        - name: Check node status
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            get nodes -o wide
+          register: cm_nodes
+          changed_when: false
+          failed_when: false
+
         - name: Show cert-manager pods
           ansible.builtin.command: >
             /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
             -n cert-manager get pods -o wide
           register: cm_pods
+          changed_when: false
+          failed_when: false
+
+        - name: Describe one of the pending pods
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            -n cert-manager describe pod -l app=cert-manager
+          register: cm_pod_desc
           changed_when: false
           failed_when: false
 
@@ -604,8 +689,16 @@
         - name: Show recent namespace events
           ansible.builtin.command: >
             /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
-            -n cert-manager get events --sort-by=.lastTimestamp | tail -n 80
+            -n cert-manager get events --sort-by=.lastTimestamp
           register: cm_events
+          changed_when: false
+          failed_when: false
+
+        - name: Show ALL cluster events (for scheduling issues)
+          ansible.builtin.command: >
+            /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+            get events --all-namespaces --sort-by=.lastTimestamp
+          register: cluster_events
           changed_when: false
           failed_when: false
 
@@ -630,17 +723,23 @@
               - "========================================"
               - "Running pods found: {{ rescue_running_count | default(0) }}"
               - ""
-              - "pods:"
+              - "NODES STATUS:"
+              - "{{ cm_nodes.stdout_lines | default([]) }}"
+              - ""
+              - "PODS STATUS:"
               - "{{ cm_pods.stdout_lines | default([]) }}"
               - ""
-              - "deploy describe:"
+              - "POD DESCRIBE (scheduling details):"
+              - "{{ cm_pod_desc.stdout_lines | default([]) | list }}"
+              - ""
+              - "DEPLOYMENT DESCRIBE:"
               - "{{ cm_deploy_desc.stdout_lines | default([]) }}"
               - ""
-              - "logs (controller):"
-              - "{{ cm_logs.stdout_lines | default([]) }}"
-              - ""
-              - "recent events:"
+              - "CERT-MANAGER NAMESPACE EVENTS:"
               - "{{ cm_events.stdout_lines | default([]) }}"
+              - ""
+              - "ALL CLUSTER EVENTS (last 50):"
+              - "{{ cluster_events.stdout_lines | default([]) | list[-50:] }}"
 
         - name: Fail cert-manager rollout only if no pods are running
           ansible.builtin.fail:
