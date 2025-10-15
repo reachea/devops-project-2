@@ -473,13 +473,7 @@
 
         - name: Detect ImagePullBackOff on controller
           ansible.builtin.set_fact:
-            cm_pull_issue: >-
-              {{ (cm_pods_json.stdout | from_json).items
-                | selectattr('metadata.labels.app','equalto','cert-manager')
-                | map(attribute='status.containerStatuses') | list | sum(start=[])
-                | selectattr('state.waiting.reason','defined')
-                | selectattr('state.waiting.reason','equalto','ImagePullBackOff')
-                | list | length > 0 }}
+            cm_pull_issue: "{{ 'ImagePullBackOff' in cm_pods_json.stdout }}"
 
         - name: If ImagePullBackOff, retarget images to ghcr.io and retry rollout
           when: cm_rollout_failed and cm_pull_issue
@@ -558,10 +552,7 @@
 
         - name: Check if all deployments succeeded
           ansible.builtin.set_fact:
-            all_deployments_ok: >-
-              {{ (cm_ctrl_rollout.rc == 0 or (cm_ctrl_rollout_after_patch is defined and cm_ctrl_rollout_after_patch.rc == 0) or (cm_ctrl_final is defined and cm_ctrl_final.rc == 0))
-                 and cm_cainj_rollout.rc == 0
-                 and cm_webhook_rollout.rc == 0 }}
+            all_deployments_ok: "{{ (cm_ctrl_rollout.rc == 0 or (cm_ctrl_rollout_after_patch is defined and cm_ctrl_rollout_after_patch.rc == 0) or (cm_ctrl_final is defined and cm_ctrl_final.rc == 0)) and cm_cainj_rollout.rc == 0 and cm_webhook_rollout.rc == 0 }}"
 
         - name: Final check - at least verify pods are running
           when: not all_deployments_ok | bool
@@ -579,7 +570,7 @@
 
             - name: Count running pods
               ansible.builtin.set_fact:
-                running_pods_count: "{{ (running_pods_check.stdout | from_json).items | length }}"
+                running_pods_count: "{{ (running_pods_check.stdout | from_json)['items'] | length }}"
 
             - name: Override success if we have at least 3 running pods
               ansible.builtin.set_fact:
@@ -628,7 +619,7 @@
 
         - name: Count running pods in rescue
           ansible.builtin.set_fact:
-            rescue_running_count: "{{ (rescue_running_pods.stdout | from_json).items | length }}"
+            rescue_running_count: "{{ (rescue_running_pods.stdout | from_json)['items'] | length }}"
           when: rescue_running_pods.rc == 0
 
         - name: Diagnostics (cert-manager)
