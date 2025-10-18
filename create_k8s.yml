@@ -439,10 +439,37 @@
       ansible.builtin.debug:
         msg: "Control plane NoSchedule taints: {{ cp_taints.stdout | default('none') }}"
 
+    - name: Check for cloudprovider uninitialized taint
+      ansible.builtin.shell: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints[?(@.key=="node.cloudprovider.kubernetes.io/uninitialized")]}{"\n"}{end}'
+      register: cloudprovider_taint_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display cloudprovider taint status
+      ansible.builtin.debug:
+        msg: "Nodes with cloudprovider uninitialized taint: {{ cloudprovider_taint_check.stdout_lines | default(['none']) }}"
+
+    - name: Remove cloudprovider uninitialized taint from all nodes
+      when: "'node.cloudprovider.kubernetes.io/uninitialized' in cloudprovider_taint_check.stdout"
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        taint nodes --all node.cloudprovider.kubernetes.io/uninitialized:NoSchedule-
+      register: remove_cloudprovider_taint
+      changed_when: remove_cloudprovider_taint.rc == 0
+      failed_when: false
+
+    - name: Confirm taint removal
+      when: remove_cloudprovider_taint is defined and remove_cloudprovider_taint.changed
+      ansible.builtin.debug:
+        msg: "Removed cloudprovider uninitialized taint from all nodes"
+
     - name: Remove NoSchedule taint from control plane if present and workers exist
       when:
         - worker_count | int > 0
         - "'node-role.kubernetes.io/control-plane' in cp_taints.stdout"
+```
       ansible.builtin.command: >
         /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
         taint nodes -l node-role.kubernetes.io/control-plane node-role.kubernetes.io/control-plane:NoSchedule-
