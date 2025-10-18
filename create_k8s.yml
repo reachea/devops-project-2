@@ -469,7 +469,6 @@
       when:
         - worker_count | int > 0
         - "'node-role.kubernetes.io/control-plane' in cp_taints.stdout"
-```
       ansible.builtin.command: >
         /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
         taint nodes -l node-role.kubernetes.io/control-plane node-role.kubernetes.io/control-plane:NoSchedule-
