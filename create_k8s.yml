@@ -485,46 +485,10 @@
       changed_when: untaint_single.rc == 0
       failed_when: false
 
-    # --- Install DigitalOcean Cloud Controller Manager (CCM) ---
-    - name: Create DigitalOcean CCM secret with API token
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig_path }}"
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: digitalocean
-            namespace: kube-system
-          type: Opaque
-          stringData:
-            access-token: "{{ lookup('env', 'DO_AUTH_TOKEN') }}"
-
-    - name: Download DigitalOcean CCM manifest
+    # --- Install ingress-nginx with NodePort (simpler than LoadBalancer + CCM) ---
+    - name: Download ingress-nginx manifest (baremetal/NodePort)
       ansible.builtin.get_url:
-        url: https://raw.githubusercontent.com/digitalocean/digitalocean-cloud-controller-manager/master/releases/v0.1.47.yml
-        dest: /tmp/do-ccm.yaml
-        mode: "0644"
-
-    - name: Apply DigitalOcean CCM
-      kubernetes.core.k8s:
-        kubeconfig: "{{ kubeconfig_path }}"
-        state: present
-        src: /tmp/do-ccm.yaml
-
-    - name: Wait for DigitalOcean CCM to be ready
-      ansible.builtin.command: >
-        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
-        -n kube-system rollout status daemonset/digitalocean-cloud-controller-manager --timeout=180s
-      register: ccm_rollout
-      changed_when: false
-      retries: 3
-      delay: 10
-      until: ccm_rollout.rc == 0
-
-    - name: Download ingress-nginx manifest (cloud provider)
-      ansible.builtin.get_url:
-        url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+        url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/baremetal/deploy.yaml
         dest: ./ingress-nginx.yaml
 
     - name: Apply ingress-nginx
@@ -1006,39 +970,63 @@
                           port:
                             number: 443
 
-    # -------------------- Wait for Ingress LB & Prompt for DNS --------------------
-    - name: Wait for ingress-nginx external IP/hostname to be assigned
+    # -------------------- Get NodePort info & Show manual LB configuration --------------------
+    - name: Get ingress-nginx NodePorts
       ansible.builtin.command: kubectl -n ingress-nginx get svc ingress-nginx-controller -o json
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
       register: svcjson
       changed_when: false
-      retries: 60
-      delay: 10
-      until: >
-        (svcjson.stdout | from_json).status.loadBalancer.ingress is defined and
-        ((svcjson.stdout | from_json).status.loadBalancer.ingress | length) > 0 and
-        (((svcjson.stdout | from_json).status.loadBalancer.ingress[0].ip | default('')) != '' or
-         ((svcjson.stdout | from_json).status.loadBalancer.ingress[0].hostname | default('')) != '')
 
-    - name: Extract ingress external address
+    - name: Extract HTTP and HTTPS NodePorts
       ansible.builtin.set_fact:
-        ingress_ip: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].ip | default('') }}"
-        ingress_hostname: "{{ (svcjson.stdout | from_json).status.loadBalancer.ingress[0].hostname | default('') }}"
-        ingress_addr: "{{ (ingress_ip | length > 0) | ternary(ingress_ip, ingress_hostname) }}"
+        http_nodeport: "{{ (svcjson.stdout | from_json).spec.ports | selectattr('name', 'equalto', 'http') | map(attribute='nodePort') | first }}"
+        https_nodeport: "{{ (svcjson.stdout | from_json).spec.ports | selectattr('name', 'equalto', 'https') | map(attribute='nodePort') | first }}"
 
-    - name: Show DNS instructions
+    - name: Get API Load Balancer IP (we'll reuse this for ingress)
+      ansible.builtin.set_fact:
+        api_lb_ip: "{{ external_lb_ip }}"
+
+    - name: Show manual configuration instructions
       ansible.builtin.debug:
         msg:
-          - "Ingress external address: {{ ingress_addr }}"
-          - "Please create A/CNAME records pointing to this address:"
-          - "  - {{ argocd_domain }} -> {{ ingress_addr }}"
-          - "  - {{ dashboard_domain }} -> {{ ingress_addr }}"
+          - "=========================================="
+          - "MANUAL CONFIGURATION REQUIRED"
+          - "=========================================="
+          - ""
+          - "Your ingress-nginx is using NodePort (simpler than LoadBalancer):"
+          - "  - HTTP NodePort:  {{ http_nodeport }}"
+          - "  - HTTPS NodePort: {{ https_nodeport }}"
+          - ""
+          - "OPTION 1: Reuse existing API Load Balancer (RECOMMENDED)"
+          - "  1. Go to DigitalOcean -> Networking -> Load Balancers"
+          - "  2. Edit your API Load Balancer (IP: {{ api_lb_ip }})"
+          - "  3. Add forwarding rules:"
+          - "     - HTTP:  80 → {{ https_nodeport }} (yes, redirect HTTP to HTTPS port)"
+          - "     - HTTPS: 443 → {{ https_nodeport }}"
+          - "  4. Save changes"
+          - ""
+          - "OPTION 2: Create new Load Balancer ($12/month)"
+          - "  1. Create new LB in DigitalOcean console"
+          - "  2. Add all 3 nodes as backends"
+          - "  3. Forwarding rules: 80→{{ http_nodeport }}, 443→{{ https_nodeport }}"
+          - "  4. Use the new LB IP below"
+          - ""
+          - "After configuring LB, create DNS A records pointing to: {{ api_lb_ip }}"
+          - "  - {{ argocd_domain }} -> {{ api_lb_ip }}"
+          - "  - {{ dashboard_domain }} -> {{ api_lb_ip }}"
+          - ""
+          - "=========================================="
 
-    - name: Confirm DNS added or wait
+    - name: Confirm LB configured and DNS added
       ansible.builtin.pause:
-        prompt: "Add the DNS records now, then press Enter to continue (or it will wait {{ dns_wait_seconds }}s if dns_wait_mode: seconds)."
-        seconds: "{{ 0 if dns_wait_mode == 'prompt' else dns_wait_seconds | int }}"
+        prompt: |
+
+          Have you:
+          1. Added forwarding rules to Load Balancer (80→{{ https_nodeport }}, 443→{{ https_nodeport }})?
+          2. Created DNS A records ({{ argocd_domain }}, {{ dashboard_domain }} → {{ api_lb_ip }})?
+
+          Press Enter to continue...
 
     # -------------------- Outputs --------------------
     - name: Read ArgoCD initial admin password
