@@ -496,6 +496,28 @@
         state: present
         src: ./ingress-nginx.yaml
 
+    - name: Wait for ingress-nginx controller to be ready
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=300s
+      register: ingress_rollout
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: ingress_rollout.rc == 0
+      failed_when: false
+
+    - name: Wait for ingress-nginx admission webhook to be ready
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n ingress-nginx wait --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=300s
+      register: ingress_webhook_ready
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: ingress_webhook_ready.rc == 0
+      failed_when: false
+
     # --- cert-manager (pinned manifest for k8s 1.28) ---
     - name: Set cert-manager version compatible with {{ k8s_version }}
       ansible.builtin.set_fact:
