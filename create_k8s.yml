@@ -985,7 +985,7 @@
 
     - name: Get API Load Balancer IP (we'll reuse this for ingress)
       ansible.builtin.set_fact:
-        api_lb_ip: "{{ external_lb_ip }}"
+        api_lb_ip: "{{ apiserver_lb_addr }}"
 
     - name: Show manual configuration instructions
       ansible.builtin.debug:
