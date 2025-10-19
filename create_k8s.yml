@@ -23,6 +23,19 @@
           - do_token | length > 0
         fail_msg: "DO_TOKEN environment variable is required."
 
+    - name: Validate required variables from group_vars/all.yml
+      ansible.builtin.assert:
+        that:
+          - region is defined and region | length > 0
+          - cluster_name is defined and cluster_name | length > 0
+          - api_lb_name is defined and api_lb_name | length > 0
+          - argocd_domain is defined and argocd_domain | length > 0
+          - dashboard_domain is defined and dashboard_domain | length > 0
+          - email_acme is defined and email_acme | length > 0
+          - cp_count is defined and cp_count | int > 0
+          - worker_count is defined and worker_count | int >= 0
+        fail_msg: "Missing required variables in group_vars/all.yml"
+
     - name: Install base system deps
       ansible.builtin.apt:
         name:
@@ -1035,14 +1048,31 @@
         KUBECONFIG: "{{ kubeconfig_path }}"
       register: argopass_b64
       changed_when: false
+      failed_when: false
+      retries: 3
+      delay: 5
+      until: argopass_b64.rc == 0
 
     - name: Print access info
       ansible.builtin.debug:
         msg:
-          - "API LB (6443): {{ apiserver_lb_addr }}"
-          - "Ingress: {{ ingress_addr }}"
-          - "ArgoCD: https://{{ argocd_domain }}  (admin / {{ (argopass_b64.stdout | b64decode) if argopass_b64.stdout else 'N/A' }})"
-          - "Dashboard: https://{{ dashboard_domain }} (token printed below)"
+          - "=========================================="
+          - "SETUP COMPLETE!"
+          - "=========================================="
+          - ""
+          - "API Load Balancer: {{ apiserver_lb_addr }}"
+          - "Ingress NodePorts: HTTP={{ http_nodeport }}, HTTPS={{ https_nodeport }}"
+          - ""
+          - "After configuring Load Balancer forwarding rules and DNS:"
+          - ""
+          - "ArgoCD:    https://{{ argocd_domain }}"
+          - "  Username: admin"
+          - "  Password: {{ (argopass_b64.stdout | b64decode) if argopass_b64.stdout else 'N/A' }}"
+          - ""
+          - "Dashboard: https://{{ dashboard_domain }}"
+          - "  Token printed below"
+          - ""
+          - "=========================================="
 
     - name: Print Dashboard token
       ansible.builtin.command: kubectl -n kubernetes-dashboard create token admin-user
@@ -1050,7 +1080,11 @@
         KUBECONFIG: "{{ kubeconfig_path }}"
       register: dash_token
       changed_when: false
+      failed_when: false
+      retries: 3
+      delay: 5
+      until: dash_token.rc == 0
 
     - name: Dashboard token (copy this for login)
       ansible.builtin.debug:
-        msg: "{{ dash_token.stdout }}"
+        msg: "{{ dash_token.stdout if dash_token.rc == 0 else 'Failed to generate token - try manually: kubectl -n kubernetes-dashboard create token admin-user' }}"
