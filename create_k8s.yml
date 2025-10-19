@@ -485,6 +485,43 @@
       changed_when: untaint_single.rc == 0
       failed_when: false
 
+    # --- Install DigitalOcean Cloud Controller Manager (CCM) ---
+    - name: Create DigitalOcean CCM secret with API token
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: digitalocean
+            namespace: kube-system
+          type: Opaque
+          stringData:
+            access-token: "{{ lookup('env', 'DO_AUTH_TOKEN') }}"
+
+    - name: Download DigitalOcean CCM manifest
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/digitalocean/digitalocean-cloud-controller-manager/master/releases/v0.1.47.yml
+        dest: /tmp/do-ccm.yaml
+        mode: "0644"
+
+    - name: Apply DigitalOcean CCM
+      kubernetes.core.k8s:
+        kubeconfig: "{{ kubeconfig_path }}"
+        state: present
+        src: /tmp/do-ccm.yaml
+
+    - name: Wait for DigitalOcean CCM to be ready
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n kube-system rollout status daemonset/digitalocean-cloud-controller-manager --timeout=180s
+      register: ccm_rollout
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: ccm_rollout.rc == 0
+
     - name: Download ingress-nginx manifest (cloud provider)
       ansible.builtin.get_url:
         url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
