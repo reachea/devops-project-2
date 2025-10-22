@@ -1041,6 +1041,120 @@
 
           Press Enter to continue...
 
+    # -------------------- Verify HTTPS Certificates --------------------
+    - name: Check if ArgoCD certificate exists
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n argocd get certificate argocd-tls
+      register: argocd_cert_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check if Dashboard certificate exists
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n kubernetes-dashboard get certificate dashboard-tls
+      register: dashboard_cert_check
+      changed_when: false
+      failed_when: false
+
+    - name: Wait for ArgoCD certificate to be ready
+      when: argocd_cert_check.rc == 0
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n argocd get certificate argocd-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: argocd_cert_ready
+      changed_when: false
+      failed_when: false
+      retries: 30
+      delay: 10
+      until: argocd_cert_ready.stdout == "True"
+
+    - name: Wait for Dashboard certificate to be ready
+      when: dashboard_cert_check.rc == 0
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        -n kubernetes-dashboard get certificate dashboard-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: dashboard_cert_ready
+      changed_when: false
+      failed_when: false
+      retries: 30
+      delay: 10
+      until: dashboard_cert_ready.stdout == "True"
+
+    - name: Check for pending challenges
+      ansible.builtin.command: >
+        /usr/local/bin/kubectl --kubeconfig {{ kubeconfig_path }}
+        get challenges -A -o json
+      register: challenges_check
+      changed_when: false
+      failed_when: false
+
+    - name: Show certificate status
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "HTTPS CERTIFICATE STATUS"
+          - "=========================================="
+          - ""
+          - "ArgoCD ({{ argocd_domain }}):"
+          - "  Certificate exists: {{ 'Yes' if argocd_cert_check.rc == 0 else 'No - will be created automatically' }}"
+          - "  Status: {{ '✅ READY - Valid HTTPS certificate issued!' if (argocd_cert_check.rc == 0 and argocd_cert_ready.stdout == 'True') else '⚠️  PENDING - Certificate still being issued' if argocd_cert_check.rc == 0 else 'Not yet created' }}"
+          - ""
+          - "Dashboard ({{ dashboard_domain }}):"
+          - "  Certificate exists: {{ 'Yes' if dashboard_cert_check.rc == 0 else 'No - will be created automatically' }}"
+          - "  Status: {{ '✅ READY - Valid HTTPS certificate issued!' if (dashboard_cert_check.rc == 0 and dashboard_cert_ready.stdout == 'True') else '⚠️  PENDING - Certificate still being issued' if dashboard_cert_check.rc == 0 else 'Not yet created' }}"
+          - ""
+          - "{{ 'All certificates ready! You should see valid HTTPS (no warnings) in your browser.' if ((argocd_cert_check.rc == 0 and argocd_cert_ready.stdout == 'True') and (dashboard_cert_check.rc == 0 and dashboard_cert_ready.stdout == 'True')) else 'Certificates are still being issued by Let\\'s Encrypt. This can take 2-5 minutes.' }}"
+          - ""
+          - "=========================================="
+
+    - name: Show troubleshooting info if certificates not ready
+      when: >
+        (argocd_cert_check.rc != 0 or argocd_cert_ready.stdout != "True") or
+        (dashboard_cert_check.rc != 0 or dashboard_cert_ready.stdout != "True")
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "⚠️  CERTIFICATES NOT READY YET"
+          - ""
+          - "If you see 'untrusted certificate' warnings in your browser, this is normal!"
+          - "The browser is showing ingress-nginx's default self-signed certificate."
+          - ""
+          - "Let's Encrypt is working on issuing valid certificates. To check progress:"
+          - ""
+          - "  # Check certificate status"
+          - "  kubectl get certificate -A"
+          - ""
+          - "  # Check for active challenges (HTTP-01 validation)"
+          - "  kubectl get challenges -A"
+          - ""
+          - "  # Check cert-manager logs for errors"
+          - "  kubectl -n cert-manager logs -l app=cert-manager --tail=50"
+          - ""
+          - "Common issues preventing certificate issuance:"
+          - ""
+          - "1. DNS not resolving correctly:"
+          - "   Test: nslookup {{ argocd_domain }}"
+          - "   Should return: {{ api_lb_ip }}"
+          - ""
+          - "2. Load Balancer not forwarding port 80 (needed for HTTP-01 challenge):"
+          - "   Check: DigitalOcean Console → Load Balancers → Forwarding Rules"
+          - "   Must have: TCP 80 → {{ http_nodeport }}"
+          - ""
+          - "3. Firewall blocking Let's Encrypt servers:"
+          - "   Test: curl http://{{ argocd_domain }}/.well-known/acme-challenge/test"
+          - "   Should connect (404 is OK, connection refused is BAD)"
+          - ""
+          - "To force certificate reissuance (if stuck):"
+          - "  kubectl delete certificate -n argocd argocd-tls"
+          - "  kubectl delete certificate -n kubernetes-dashboard dashboard-tls"
+          - "  # Wait 2-3 minutes for cert-manager to recreate them"
+          - ""
+          - "Once certificates are issued (Ready: True), refresh your browser."
+          - "The untrusted certificate warning will disappear automatically."
+          - ""
+
     # -------------------- Outputs --------------------
     - name: Read ArgoCD initial admin password
       ansible.builtin.command: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}'
